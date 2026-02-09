@@ -3,9 +3,29 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 import os
 import json
+import subprocess
+import sys
 import kv_to_excel_idempotent_sync
 
 CONFIG_FILE = "config.json"
+
+
+def get_runtime_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def run_post_sync_exe():
+    sync_exe = os.path.join(get_runtime_dir(), "dzsj-kv-sync.exe")
+    if not os.path.isfile(sync_exe):
+        return False, f"未找到后续程序：{sync_exe}"
+
+    try:
+        subprocess.Popen([sync_exe], cwd=os.path.dirname(sync_exe))
+        return True, None
+    except Exception as e:
+        return False, str(e)
 
 def load_config():
     if os.path.exists(CONFIG_FILE):
@@ -361,6 +381,11 @@ class App:
             messagebox.showwarning("部分失败", msg)
         else:
             messagebox.showinfo("成功", f"全部转换成功！共 {success} 个 Excel 文件。")
+
+        if success > 0:
+            launched, err = run_post_sync_exe()
+            if not launched:
+                messagebox.showwarning("后续同步未启动", err)
 
     def convert_kv_to_excel(self):
         excel_path = self.excel_path_var.get()
