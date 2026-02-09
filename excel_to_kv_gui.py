@@ -1,0 +1,452 @@
+import openpyxl
+import tkinter as tk
+from tkinter import filedialog, messagebox
+import os
+import json
+import kv_to_excel_idempotent_sync
+
+CONFIG_FILE = "config.json"
+
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=4)
+    except:
+        pass
+    
+def is_commented_row(row):
+    if not row:
+        return True
+    for cell in row:
+        if cell not in (None, "", " "):
+            return str(cell).strip().startswith("#")
+    return True
+
+
+############################################
+#               KV 转换核心
+############################################
+
+def excel_to_kv(excel_path, output_path):
+    # Version: 3.0.4
+    
+    wb = openpyxl.load_workbook(excel_path, data_only=True)
+    ws = wb.worksheets[0]
+    rows = list(ws.iter_rows(values_only=True))
+
+    # ============================================================
+    # 1. 动态查找 Root Name (严格遵循：第一个非空、非注释的单元格内容)
+    # ============================================================
+    root_name = None
+    
+    # 遍历所有行和所有单元格
+    root_name = None
+
+    for row in rows:
+        if is_commented_row(row):
+            continue
+
+        for cell in row:
+            if cell not in (None, "", " "):
+                root_name = str(cell).strip()
+                break
+
+        if root_name:
+            break
+    
+    # 如果找不到 Root Name，抛出错误
+    if root_name is None:
+        raise ValueError("无法在 Excel 文件中找到有效的 Root 名称（第一个非空、非注释的单元格内容）。")
+
+    # ============================================================
+    # 2. 标题行和主键列定位
+    # ============================================================
+    header_row_idx = None
+    for idx, row in enumerate(rows):
+        if is_commented_row(row):
+            continue
+        header_row_idx = idx
+        break
+
+    if header_row_idx is None:
+        raise ValueError("Excel 文件必须包含标题行（非注释行）。")
+
+    data_start_idx = header_row_idx + 1
+
+    header = rows[header_row_idx]
+    clean_headers = [str(h).strip() if h not in (None, "", " ") else None for h in header]
+
+    primary_key_col = -1
+    for i, h in enumerate(clean_headers):
+        if h is not None:
+            primary_key_col = i
+            break
+            
+    if primary_key_col == -1:
+        raise ValueError("无法在标题行中找到主键列。")
+
+    # ============================================================
+    # 3. KV 结构生成
+    # ============================================================
+
+    kv_lines = []
+    data_rows = rows[data_start_idx:]
+
+    kv_lines.append(f'"{root_name}"')
+    kv_lines.append('{')
+
+    for row in data_rows:
+        if is_commented_row(row):
+            continue
+        
+        # 检查行是否为空或主键值为空
+        if row is None or len(row) <= primary_key_col or row[primary_key_col] in (None, "", " "):
+            continue
+
+        # 核心功能: 检查第一列是否为注释行 (#)
+        pk_cell_value = str(row[primary_key_col]).strip()
+        if pk_cell_value.startswith('#'):
+            continue
+            
+        # Primary Key (主键，如 '1', '2')
+        primary_key = pk_cell_value
+        
+        # 修正浮点数主键：如 1.0 -> '1'
+        if primary_key.endswith('.0') and primary_key[:-2].isdigit():
+             primary_key = primary_key[:-2]
+        
+        # Start Primary Key Block
+        kv_lines.append(f'\t"{primary_key}"')
+        kv_lines.append('\t{')
+
+        # Data fields
+        for col_idx, header in enumerate(clean_headers):
+            # 跳过空标题列和主键列本身
+            if header is None or col_idx == primary_key_col:
+                continue
+            
+            # 获取当前列的值
+            value = row[col_idx] if col_idx < len(row) else None
+            value_str = str(value).strip() if value is not None else ""
+            
+            # 跳过空字段
+            if not value_str:
+                continue
+                
+            # 核心逻辑：基于内容判断是否需要嵌套解析 (包含 | 或 , 则嵌套)
+            if '|' in value_str or ',' in value_str:
+                
+                # Start Nested Block
+                kv_lines.append(f'\t\t"{header}"')
+                kv_lines.append('\t\t{')
+                
+                # Split the array-like string by ',' for multiple pairs
+                pairs = [p.strip() for p in value_str.split(',') if p.strip()]
+                
+                for pair in pairs:
+                    # Split each pair by '|' for key and value
+                    if '|' in pair:
+                        # Split only once
+                        key, val = [p.strip() for p in pair.split('|', 1)] 
+                        if key and val: 
+                            kv_lines.append(f'\t\t\t"{key}" "{val}"')
+                    # 否则：跳过格式不正确的键值对
+
+                # End Nested Block
+                kv_lines.append('\t\t}')
+            
+            # 普通字段（不含 | 或 ,）
+            else:
+                # 写入 Key-Value pair
+                kv_lines.append(f'\t\t"{header}" "{value_str}"')
+
+        # End Primary Key Block
+        kv_lines.append('\t}')
+
+    # 3. Close Root Block
+    kv_lines.append('}')
+    
+    # Write to file
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(kv_lines))
+        
+############################################
+#               GUI 部分
+############################################
+
+class App:
+    def __init__(self, root):
+        self.root = root
+        root.title("Excel → KV 转换工具")
+        self.config = load_config()
+
+        # Excel 路径
+        self.excel_label = tk.Label(root, text="Excel 文件：")
+        self.excel_label.grid(row=0, column=0, padx=5, pady=5, sticky="w")
+
+        self.excel_path_var = tk.StringVar()
+        self.excel_entry = tk.Entry(root, textvariable=self.excel_path_var, width=50)
+        self.excel_entry.grid(row=0, column=1, padx=5, pady=5)
+        
+        if "last_excel_dir" in self.config:
+            self.excel_path_var.set(self.config["last_excel_dir"])
+
+        self.excel_btn = tk.Button(root, text="选择文件", command=self.select_excel)
+        self.excel_btn.grid(row=0, column=2, padx=5, pady=5)
+        
+        self.excel_folder_btn = tk.Button(root, text="选择文件夹", command=self.select_excel_folder)
+        self.excel_folder_btn.grid(row=0, column=3, padx=5, pady=5)
+
+        # 输出目录
+        self.output_label = tk.Label(root, text="KV文件目录：")
+        self.output_label.grid(row=1, column=0, padx=5, pady=5, sticky="w")
+
+        self.output_path_var = tk.StringVar()
+        self.output_entry = tk.Entry(root, textvariable=self.output_path_var, width=50)
+        self.output_entry.grid(row=1, column=1, padx=5, pady=5)
+
+        if "last_output_dir" in self.config:
+            self.output_path_var.set(self.config["last_output_dir"])
+    
+        self.output_btn = tk.Button(root, text="选择文件夹", command=self.select_output_folder)
+        self.output_btn.grid(row=1, column=2, padx=5, pady=5)
+
+        # 转换按钮
+        self.convert_btn = tk.Button(root, text="Excel 转 KV", command=self.convert, width=20, height=2)
+        self.convert_btn.grid(row=2, column=1, pady=20)
+        
+        self.kv_to_excel_btn = tk.Button(root, text="KV 转 Excel", command=self.convert_kv_to_excel, width=20, height=2)
+        self.kv_to_excel_btn.grid(row=2, column=2, padx=10, pady=20)
+
+    ############################################
+    #        GUI 功能函数
+    ############################################
+
+    def select_excel(self):
+        initial = self.config.get("last_excel_dir", "")
+
+        file_path = filedialog.askopenfilename(
+            title="选择 Excel 文件",
+            filetypes=[("Excel Files", "*.xlsx *.xls")],
+            initialdir=initial if os.path.isdir(initial) else ""
+        )
+
+        if file_path:
+            self.excel_path_var.set(file_path)
+
+            # 记录新路径
+            excel_dir = os.path.dirname(file_path)
+            self.config["last_excel_dir"] = excel_dir
+            save_config(self.config)
+            
+    def select_excel_folder(self):
+        initial = self.config.get("last_excel_dir", "")
+
+        folder = filedialog.askdirectory(
+            title="选择包含 Excel 的文件夹",
+            initialdir=initial if os.path.isdir(initial) else ""
+        )
+
+        if folder:
+            self.excel_path_var.set(folder)
+
+            self.config["last_excel_dir"] = folder
+            save_config(self.config)
+
+
+
+    def select_output_folder(self):
+        initial = self.config.get("last_output_dir", "")
+
+        folder = filedialog.askdirectory(
+            title="选择输出目录",
+            initialdir=initial if os.path.isdir(initial) else ""
+        )
+
+        if folder:
+            self.output_path_var.set(folder)
+
+            # 记录新路径
+            self.config["last_output_dir"] = folder
+            save_config(self.config)
+
+    def convert(self):
+        excel_path = self.excel_path_var.get()
+        output_root = self.output_path_var.get()
+
+        if not excel_path:
+            messagebox.showerror("错误", "请选择有效的 Excel 文件或文件夹")
+            return
+
+        if not output_root or not os.path.isdir(output_root):
+            messagebox.showerror("错误", "请选择有效的输出目录")
+            return
+
+        # 记住输出目录
+        self.config["last_output_dir"] = output_root
+        save_config(self.config)
+
+        # ---------------------------------------------------------
+        # 判断是文件还是文件夹
+        # ---------------------------------------------------------
+        excel_files = []
+
+        if os.path.isfile(excel_path):
+            # 单文件
+            excel_files.append(excel_path)
+
+        elif os.path.isdir(excel_path):
+            # 批量模式：扫描文件夹内所有 EXCEL 文件
+            for f in os.listdir(excel_path):
+                full = os.path.join(excel_path, f)
+                if os.path.isfile(full) and f.lower().endswith((".xlsx", ".xls")):
+                    excel_files.append(full)
+
+            if not excel_files:
+                messagebox.showerror("错误", "该文件夹内没有找到任何 Excel 文件")
+                return
+        else:
+            messagebox.showerror("错误", "路径不是文件也不是文件夹")
+            return
+
+        # ---------------------------------------------------------
+        # 批量执行转换
+        # ---------------------------------------------------------
+        success = 0
+        failed = []
+
+        for excel_file in excel_files:
+            base_name = os.path.splitext(os.path.basename(excel_file))[0]
+            target_filename = base_name + ".txt"
+
+            # 递归搜索原始 txt（保持你原来的逻辑）
+            matched_path = None
+            for root, dirs, files in os.walk(output_root):
+                for f in files:
+                    if f.lower() == target_filename.lower():
+                        matched_path = os.path.join(root, f)
+                        break
+                if matched_path:
+                    break
+
+            if not matched_path:
+                matched_path = os.path.join(output_root, target_filename)
+
+            # 开始转换
+            try:
+                excel_to_kv(excel_file, matched_path)
+                success += 1
+            except Exception as e:
+                failed.append(f"{os.path.basename(excel_file)} : {e}")
+
+        # ---------------------------------------------------------
+        # 批量结果提示
+        # ---------------------------------------------------------
+        if failed:
+            msg = (
+                f"批量转换完成！\n"
+                f"成功：{success} 个\n"
+                f"失败：{len(failed)} 个\n\n"
+                f"失败文件列表：\n" + "\n".join(failed)
+            )
+            messagebox.showwarning("部分失败", msg)
+        else:
+            messagebox.showinfo("成功", f"全部转换成功！共 {success} 个 Excel 文件。")
+
+    def convert_kv_to_excel(self):
+        excel_path = self.excel_path_var.get()
+        kv_root = self.output_path_var.get()
+
+        if not excel_path:
+            messagebox.showerror("错误", "请选择 Excel 文件或文件夹")
+            return
+
+        if not kv_root or not os.path.isdir(kv_root):
+            messagebox.showerror("错误", "请选择有效的 KV 输出目录")
+            return
+
+        # ---------------------------------------------------------
+        # 收集 Excel 文件
+        # ---------------------------------------------------------
+        excel_files = []
+
+        if os.path.isfile(excel_path):
+            if not excel_path.lower().endswith((".xlsx", ".xls")):
+                messagebox.showerror("错误", "请选择 Excel 文件")
+                return
+            excel_files.append(excel_path)
+
+        elif os.path.isdir(excel_path):
+            for f in os.listdir(excel_path):
+                full = os.path.join(excel_path, f)
+                if os.path.isfile(full) and f.lower().endswith((".xlsx", ".xls")):
+                    excel_files.append(full)
+
+            if not excel_files:
+                messagebox.showerror("错误", "该文件夹内没有找到任何 Excel 文件")
+                return
+        else:
+            messagebox.showerror("错误", "路径不是文件也不是文件夹")
+            return
+
+        # ---------------------------------------------------------
+        # 对每个 Excel：用“同名 KV”作为数据源
+        # ---------------------------------------------------------
+        success = 0
+        failed = []
+
+        for excel_file in excel_files:
+            base_name = os.path.splitext(os.path.basename(excel_file))[0]
+            kv_name = base_name + ".txt"
+
+            # 在 KV 输出目录中查找同名 KV
+            kv_path = None
+            for root, dirs, files in os.walk(kv_root):
+                for f in files:
+                    if f.lower() == kv_name.lower():
+                        kv_path = os.path.join(root, f)
+                        break
+                if kv_path:
+                    break
+
+            if not kv_path:
+                failed.append(f"{base_name} : 未找到对应 KV")
+                continue
+
+            try:
+                kv_to_excel_idempotent_sync.kv_to_excel_idempotent_sync(kv_path, excel_file)
+                success += 1
+            except Exception as e:
+                failed.append(f"{base_name} : {e}")
+
+        # ---------------------------------------------------------
+        # 结果提示
+        # ---------------------------------------------------------
+        if failed:
+            msg = (
+                f"KV → Excel 完成！\n"
+                f"成功：{success} 个\n"
+                f"失败：{len(failed)} 个\n\n"
+                f"失败列表：\n" + "\n".join(failed)
+            )
+            messagebox.showwarning("部分失败", msg)
+        else:
+            messagebox.showinfo("成功", f"KV → Excel 同步成功！共 {success} 个文件。")
+
+############################################
+#               启动程序
+############################################
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = App(root)
+    root.mainloop()
