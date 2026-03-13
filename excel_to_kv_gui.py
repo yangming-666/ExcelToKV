@@ -5,9 +5,31 @@ import os
 import json
 import subprocess
 import sys
+import re
 import kv_to_excel_idempotent_sync
 
 CONFIG_FILE = "config.json"
+BACKEND_CONFIG_EXPORT_FILENAME = "configs.json"
+BACKEND_CONFIG_ROOTS = {
+    "account_progression.txt": ("account_progression", "AccountProgression"),
+    "career_config.txt": ("career_config", "CareerConfig"),
+    "challenge_waves.txt": ("challenge_waves", None),
+    "hero_base.txt": ("hero_base", None),
+    "hero_growth.txt": ("hero_growth", "Growth"),
+    "monster_ability.txt": ("monster_ability", None),
+    "monster_stats.txt": ("monster_stats", None),
+    "shop1.txt": ("shop1", "ShopItems"),
+    "shop1_items.txt": ("shop1_items", "Shop1 Items"),
+    "shop1_items_meta.txt": ("shop1_items_meta", "Shop1 Items Meta"),
+    "meta_growth_shop.txt": ("meta_growth_shop", "MetaGrowthShop"),
+    "shop1_items_projectile.txt": ("shop1_items_projectile", None),
+    "shop1_items_enhance.txt": ("shop1_items_enhance", None),
+    "shop1_items_enhance_passive.txt": ("shop1_items_enhance_passive", None),
+    "Stage.txt": ("stage", "Stage"),
+}
+MONSTER_WAVES_PATTERN = re.compile(r"^monster_waves_(\d+)\.txt$", re.IGNORECASE)
+KV_COMMENT_PATTERN = re.compile(r"//.*?$|/\*.*?\*/", re.MULTILINE | re.DOTALL)
+KV_TOKEN_PATTERN = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*)"|([{}])')
 
 
 def get_runtime_dir():
@@ -50,6 +72,113 @@ def is_commented_row(row):
         if cell not in (None, "", " "):
             return str(cell).strip().startswith("#")
     return True
+
+
+def _parse_kv_object(tokens, index):
+    out = {}
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "}":
+            return out, index + 1
+        if token == "{":
+            raise ValueError(f"KV 语法错误：位置 {index} 出现未预期的 '{{'")
+
+        key = token
+        index += 1
+        if index >= len(tokens):
+            raise ValueError(f"KV 语法错误：键 {key} 缺少值")
+
+        next_token = tokens[index]
+        if next_token == "{":
+            child, index = _parse_kv_object(tokens, index + 1)
+            out[key] = child
+            continue
+        if next_token == "}":
+            raise ValueError(f"KV 语法错误：键 {key} 后出现未预期的 '}}'")
+
+        out[key] = next_token
+        index += 1
+    return out, index
+
+
+def parse_kv_text(text):
+    sanitized = KV_COMMENT_PATTERN.sub("", text)
+    tokens = []
+    for string_token, brace_token in KV_TOKEN_PATTERN.findall(sanitized):
+        tokens.append(brace_token or string_token)
+
+    if not tokens:
+        return {}
+
+    index = 0
+    root = {}
+    while index < len(tokens):
+        key = tokens[index]
+        index += 1
+        if index >= len(tokens) or tokens[index] != "{":
+            raise ValueError(f"KV 语法错误：根节点 {key} 缺少 '{{'")
+        child, index = _parse_kv_object(tokens, index + 1)
+        root[key] = child
+    return root
+
+
+def normalize_config_root(parsed, root_name):
+    if root_name and isinstance(parsed.get(root_name), dict):
+        return parsed[root_name]
+    return parsed
+
+
+def find_backend_config_files(output_root):
+    matched = {}
+    monster_wave_files = {}
+
+    for root, _, files in os.walk(output_root):
+        for filename in files:
+            lower_name = filename.lower()
+            full_path = os.path.join(root, filename)
+
+            for expected_name in BACKEND_CONFIG_ROOTS:
+                if lower_name == expected_name.lower():
+                    matched[expected_name] = full_path
+                    break
+
+            wave_match = MONSTER_WAVES_PATTERN.match(filename)
+            if wave_match:
+                monster_wave_files[wave_match.group(1)] = full_path
+
+    return matched, monster_wave_files
+
+
+def export_backend_configs_json(output_root):
+    matched_files, monster_wave_files = find_backend_config_files(output_root)
+    missing = [name for name in BACKEND_CONFIG_ROOTS if name not in matched_files]
+
+    configs = {}
+    for filename, (config_key, root_name) in BACKEND_CONFIG_ROOTS.items():
+        kv_path = matched_files.get(filename)
+        if not kv_path:
+            continue
+        with open(kv_path, "r", encoding="utf-8-sig") as f:
+            parsed = parse_kv_text(f.read())
+        configs[config_key] = normalize_config_root(parsed, root_name)
+
+    monster_waves = {}
+    for level in sorted(monster_wave_files, key=lambda x: int(x)):
+        with open(monster_wave_files[level], "r", encoding="utf-8-sig") as f:
+            monster_waves[level] = parse_kv_text(f.read())
+    if monster_waves:
+        configs["monster_waves"] = monster_waves
+    else:
+        missing.append("monster_waves_*.txt")
+
+    json_dir = os.path.join(get_runtime_dir(), "JSON")
+    os.makedirs(json_dir, exist_ok=True)
+    json_path = os.path.join(json_dir, BACKEND_CONFIG_EXPORT_FILENAME)
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump({"configs": configs}, f, ensure_ascii=False, indent=2)
+
+    return json_path, missing
 
 
 ############################################
@@ -368,24 +497,45 @@ class App:
             except Exception as e:
                 failed.append(f"{os.path.basename(excel_file)} : {e}")
 
-        # ---------------------------------------------------------
-        # 批量结果提示
-        # ---------------------------------------------------------
-        if failed:
+        if success > 0:
+            json_path = None
+            export_missing = []
+            export_error = None
+
+            try:
+                json_path, export_missing = export_backend_configs_json(output_root)
+            except Exception as e:
+                export_error = str(e)
+
+            launched, err = run_post_sync_exe()
+            summary_lines = [f"Excel 转 KV 完成，成功 {success} 个文件。"]
+
+            if failed:
+                summary_lines.append(f"失败：{len(failed)} 个文件。")
+                summary_lines.append("失败文件列表：")
+                summary_lines.extend(failed)
+            if json_path:
+                summary_lines.append(f"已导出后端配置 JSON：{json_path}")
+            if export_missing:
+                summary_lines.append("以下配置 TXT 未找到，未写入 JSON：")
+                summary_lines.extend(export_missing)
+            if export_error:
+                summary_lines.append(f"导出后端配置 JSON 失败：{export_error}")
+            if not launched:
+                summary_lines.append(f"后续同步未启动：{err}")
+
+            if failed or export_missing or export_error or not launched:
+                messagebox.showwarning("转换完成", "\n".join(summary_lines))
+            else:
+                messagebox.showinfo("成功", "\n".join(summary_lines))
+        elif failed:
             msg = (
                 f"批量转换完成！\n"
-                f"成功：{success} 个\n"
+                f"成功：0 个\n"
                 f"失败：{len(failed)} 个\n\n"
                 f"失败文件列表：\n" + "\n".join(failed)
             )
-            messagebox.showwarning("部分失败", msg)
-        else:
-            messagebox.showinfo("成功", f"全部转换成功！共 {success} 个 Excel 文件。")
-
-        if success > 0:
-            launched, err = run_post_sync_exe()
-            if not launched:
-                messagebox.showwarning("后续同步未启动", err)
+            messagebox.showwarning("转换失败", msg)
 
     def convert_kv_to_excel(self):
         excel_path = self.excel_path_var.get()
