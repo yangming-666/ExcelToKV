@@ -30,6 +30,7 @@ BACKEND_CONFIG_ROOTS = {
 MONSTER_WAVES_PATTERN = re.compile(r"^monster_waves_(\d+)\.txt$", re.IGNORECASE)
 KV_COMMENT_PATTERN = re.compile(r"//.*?$|/\*.*?\*/", re.MULTILINE | re.DOTALL)
 KV_TOKEN_PATTERN = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*)"|([{}])')
+KV_QUOTED_RE = re.compile(r'"([^"]*)"')
 
 
 def get_runtime_dir():
@@ -122,6 +123,277 @@ def parse_kv_text(text):
     return root
 
 
+def split_inline_comment(raw_line):
+    in_quote = False
+    escaped = False
+    for idx, ch in enumerate(raw_line):
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == '"':
+            in_quote = not in_quote
+            continue
+        if not in_quote and raw_line[idx:idx + 2] == "//":
+            return raw_line[:idx].rstrip(), raw_line[idx:]
+    return raw_line.rstrip(), ""
+
+
+def _ensure_metadata_node(container, *keys):
+    node = container
+    for key in keys:
+        node = node.setdefault(key, {})
+    return node
+
+
+def parse_kv_comments(text):
+    metadata = {
+        "pre_root": [],
+        "root_suffix": "",
+        "root_open_comments": [],
+        "pk_comments": {},
+        "pk_suffix": {},
+        "pk_open_comments": {},
+        "field_comments": {},
+        "field_suffix": {},
+        "block_open_comments": {},
+        "subfield_comments": {},
+        "subfield_suffix": {},
+        "footer_comments": [],
+    }
+
+    pending_comments = []
+    root_seen = False
+    stack = []
+    pending_key = None
+    pending_key_suffix = ""
+    current_pk = None
+    current_block = None
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("//") or stripped.startswith("#"):
+            pending_comments.append(line)
+            continue
+
+        code, suffix = split_inline_comment(line)
+        code = code.strip()
+
+        if code == "{":
+            if pending_key is None:
+                pending_comments.append(line)
+                continue
+
+            level = len(stack)
+            key = pending_key
+            pending_key = None
+            decl_suffix = pending_key_suffix
+            pending_key_suffix = ""
+
+            if level == 0:
+                root_seen = True
+                metadata["root_open_comments"] = pending_comments[:]
+                metadata["root_suffix"] = decl_suffix
+                pending_comments = []
+                stack.append("root")
+            elif level == 1:
+                current_pk = key
+                metadata["pk_comments"][current_pk] = pending_comments[:]
+                metadata["pk_suffix"][current_pk] = decl_suffix
+                metadata["pk_open_comments"][current_pk] = []
+                pending_comments = []
+                stack.append("pk")
+            elif level == 2:
+                current_block = key
+                _ensure_metadata_node(metadata["field_comments"], current_pk)
+                _ensure_metadata_node(metadata["field_suffix"], current_pk)
+                metadata["field_comments"][current_pk][current_block] = pending_comments[:]
+                metadata["field_suffix"][current_pk][current_block] = decl_suffix
+                _ensure_metadata_node(metadata["block_open_comments"], current_pk)
+                metadata["block_open_comments"][current_pk][current_block] = []
+                pending_comments = []
+                stack.append("block")
+            else:
+                pending_comments = []
+                stack.append("block")
+            continue
+
+        if code == "}":
+            level = len(stack)
+            if level == 1:
+                metadata["footer_comments"].extend(pending_comments)
+                pending_comments = []
+            elif level == 2 and current_pk is not None:
+                metadata["pk_open_comments"][current_pk] = pending_comments[:]
+                pending_comments = []
+            elif level == 3 and current_pk is not None and current_block is not None:
+                metadata["block_open_comments"][current_pk][current_block] = pending_comments[:]
+                pending_comments = []
+
+            if stack:
+                closed = stack.pop()
+                if closed == "block":
+                    current_block = None
+                elif closed == "pk":
+                    current_pk = None
+            continue
+
+        quoted = KV_QUOTED_RE.findall(code)
+        if len(quoted) == 1:
+            pending_key = quoted[0]
+            pending_key_suffix = suffix
+            if not root_seen:
+                metadata["pre_root"] = pending_comments[:]
+                pending_comments = []
+            continue
+
+        if len(quoted) >= 2 and current_pk is not None:
+            key = quoted[0]
+            if current_block is None:
+                _ensure_metadata_node(metadata["field_comments"], current_pk)
+                _ensure_metadata_node(metadata["field_suffix"], current_pk)
+                metadata["field_comments"][current_pk][key] = pending_comments[:]
+                metadata["field_suffix"][current_pk][key] = suffix
+            else:
+                _ensure_metadata_node(metadata["subfield_comments"], current_pk, current_block)
+                _ensure_metadata_node(metadata["subfield_suffix"], current_pk, current_block)
+                metadata["subfield_comments"][current_pk][current_block][key] = pending_comments[:]
+                metadata["subfield_suffix"][current_pk][current_block][key] = suffix
+            pending_comments = []
+            continue
+
+        pending_comments.append(line)
+
+    if pending_comments:
+        metadata["footer_comments"].extend(pending_comments)
+    return metadata
+
+
+def build_excel_kv_model(rows):
+    root_name = None
+    for row in rows:
+        if is_commented_row(row):
+            continue
+        for cell in row:
+            if cell not in (None, "", " "):
+                root_name = str(cell).strip()
+                break
+        if root_name:
+            break
+
+    if root_name is None:
+        raise ValueError("无法在 Excel 文件中找到有效的 Root 名称（第一个非空、非注释的单元格内容）。")
+
+    header_row_idx = None
+    for idx, row in enumerate(rows):
+        if is_commented_row(row):
+            continue
+        header_row_idx = idx
+        break
+
+    if header_row_idx is None:
+        raise ValueError("Excel 文件必须包含标题行（非注释行）。")
+
+    header = rows[header_row_idx]
+    clean_headers = [str(h).strip() if h not in (None, "", " ") else None for h in header]
+
+    primary_key_col = -1
+    for i, h in enumerate(clean_headers):
+        if h is not None:
+            primary_key_col = i
+            break
+
+    if primary_key_col == -1:
+        raise ValueError("无法在标题行中找到主键列。")
+
+    pks = []
+    for row in rows[header_row_idx + 1:]:
+        if is_commented_row(row):
+            continue
+        if row is None or len(row) <= primary_key_col or row[primary_key_col] in (None, "", " "):
+            continue
+
+        pk = str(row[primary_key_col]).strip()
+        if pk.startswith("#"):
+            continue
+        if pk.endswith(".0") and pk[:-2].isdigit():
+            pk = pk[:-2]
+
+        fields = []
+        for col_idx, header_name in enumerate(clean_headers):
+            if header_name is None or col_idx == primary_key_col:
+                continue
+            value = row[col_idx] if col_idx < len(row) else None
+            value_str = str(value).strip() if value is not None else ""
+            if not value_str:
+                continue
+
+            if "|" in value_str or "," in value_str:
+                nested_items = []
+                for pair in [p.strip() for p in value_str.split(",") if p.strip()]:
+                    if "|" in pair:
+                        key, val = [p.strip() for p in pair.split("|", 1)]
+                        if key and val:
+                            nested_items.append((key, val))
+                fields.append(("block", header_name, nested_items))
+            else:
+                fields.append(("value", header_name, value_str))
+        pks.append((pk, fields))
+
+    return root_name, pks
+
+
+def render_kv_with_preserved_comments(root_name, pks, metadata):
+    lines = []
+
+    def emit_comment_lines(comment_lines):
+        for comment_line in comment_lines or []:
+            lines.append(comment_line)
+
+    emit_comment_lines(metadata.get("pre_root"))
+    root_suffix = metadata.get("root_suffix", "")
+    lines.append(f'"{root_name}"{(" " + root_suffix) if root_suffix else ""}')
+    lines.append("{")
+    emit_comment_lines(metadata.get("root_open_comments"))
+
+    for pk, fields in pks:
+        emit_comment_lines(metadata.get("pk_comments", {}).get(pk))
+        pk_suffix = metadata.get("pk_suffix", {}).get(pk, "")
+        lines.append(f'\t"{pk}"{(" " + pk_suffix) if pk_suffix else ""}')
+        lines.append("\t{")
+        emit_comment_lines(metadata.get("pk_open_comments", {}).get(pk))
+
+        for field_type, field_name, field_value in fields:
+            field_comments = metadata.get("field_comments", {}).get(pk, {}).get(field_name, [])
+            field_suffix = metadata.get("field_suffix", {}).get(pk, {}).get(field_name, "")
+            emit_comment_lines(field_comments)
+
+            if field_type == "block":
+                lines.append(f'\t\t"{field_name}"{(" " + field_suffix) if field_suffix else ""}')
+                lines.append("\t\t{")
+                emit_comment_lines(metadata.get("block_open_comments", {}).get(pk, {}).get(field_name))
+                for sub_key, sub_value in field_value:
+                    sub_comments = metadata.get("subfield_comments", {}).get(pk, {}).get(field_name, {}).get(sub_key, [])
+                    sub_suffix = metadata.get("subfield_suffix", {}).get(pk, {}).get(field_name, {}).get(sub_key, "")
+                    emit_comment_lines(sub_comments)
+                    lines.append(
+                        f'\t\t\t"{sub_key}" "{sub_value}"{(" " + sub_suffix) if sub_suffix else ""}'
+                    )
+                lines.append("\t\t}")
+            else:
+                lines.append(
+                    f'\t\t"{field_name}" "{field_value}"{(" " + field_suffix) if field_suffix else ""}'
+                )
+
+        lines.append("\t}")
+
+    emit_comment_lines(metadata.get("footer_comments"))
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
 def normalize_config_root(parsed, root_name):
     if root_name and isinstance(parsed.get(root_name), dict):
         return parsed[root_name]
@@ -186,147 +458,25 @@ def export_backend_configs_json(output_root):
 ############################################
 
 def excel_to_kv(excel_path, output_path):
-    # Version: 3.0.4
+    # Version: 3.1.0
     
     wb = openpyxl.load_workbook(excel_path, data_only=True)
     ws = wb.worksheets[0]
     rows = list(ws.iter_rows(values_only=True))
 
-    # ============================================================
-    # 1. 动态查找 Root Name (严格遵循：第一个非空、非注释的单元格内容)
-    # ============================================================
-    root_name = None
-    
-    # 遍历所有行和所有单元格
-    root_name = None
+    root_name, pks = build_excel_kv_model(rows)
+    metadata = {}
 
-    for row in rows:
-        if is_commented_row(row):
-            continue
+    if os.path.isfile(output_path):
+        try:
+            with open(output_path, "r", encoding="utf-8-sig") as f:
+                metadata = parse_kv_comments(f.read())
+        except Exception:
+            metadata = {}
 
-        for cell in row:
-            if cell not in (None, "", " "):
-                root_name = str(cell).strip()
-                break
-
-        if root_name:
-            break
-    
-    # 如果找不到 Root Name，抛出错误
-    if root_name is None:
-        raise ValueError("无法在 Excel 文件中找到有效的 Root 名称（第一个非空、非注释的单元格内容）。")
-
-    # ============================================================
-    # 2. 标题行和主键列定位
-    # ============================================================
-    header_row_idx = None
-    for idx, row in enumerate(rows):
-        if is_commented_row(row):
-            continue
-        header_row_idx = idx
-        break
-
-    if header_row_idx is None:
-        raise ValueError("Excel 文件必须包含标题行（非注释行）。")
-
-    data_start_idx = header_row_idx + 1
-
-    header = rows[header_row_idx]
-    clean_headers = [str(h).strip() if h not in (None, "", " ") else None for h in header]
-
-    primary_key_col = -1
-    for i, h in enumerate(clean_headers):
-        if h is not None:
-            primary_key_col = i
-            break
-            
-    if primary_key_col == -1:
-        raise ValueError("无法在标题行中找到主键列。")
-
-    # ============================================================
-    # 3. KV 结构生成
-    # ============================================================
-
-    kv_lines = []
-    data_rows = rows[data_start_idx:]
-
-    kv_lines.append(f'"{root_name}"')
-    kv_lines.append('{')
-
-    for row in data_rows:
-        if is_commented_row(row):
-            continue
-        
-        # 检查行是否为空或主键值为空
-        if row is None or len(row) <= primary_key_col or row[primary_key_col] in (None, "", " "):
-            continue
-
-        # 核心功能: 检查第一列是否为注释行 (#)
-        pk_cell_value = str(row[primary_key_col]).strip()
-        if pk_cell_value.startswith('#'):
-            continue
-            
-        # Primary Key (主键，如 '1', '2')
-        primary_key = pk_cell_value
-        
-        # 修正浮点数主键：如 1.0 -> '1'
-        if primary_key.endswith('.0') and primary_key[:-2].isdigit():
-             primary_key = primary_key[:-2]
-        
-        # Start Primary Key Block
-        kv_lines.append(f'\t"{primary_key}"')
-        kv_lines.append('\t{')
-
-        # Data fields
-        for col_idx, header in enumerate(clean_headers):
-            # 跳过空标题列和主键列本身
-            if header is None or col_idx == primary_key_col:
-                continue
-            
-            # 获取当前列的值
-            value = row[col_idx] if col_idx < len(row) else None
-            value_str = str(value).strip() if value is not None else ""
-            
-            # 跳过空字段
-            if not value_str:
-                continue
-                
-            # 核心逻辑：基于内容判断是否需要嵌套解析 (包含 | 或 , 则嵌套)
-            if '|' in value_str or ',' in value_str:
-                
-                # Start Nested Block
-                kv_lines.append(f'\t\t"{header}"')
-                kv_lines.append('\t\t{')
-                
-                # Split the array-like string by ',' for multiple pairs
-                pairs = [p.strip() for p in value_str.split(',') if p.strip()]
-                
-                for pair in pairs:
-                    # Split each pair by '|' for key and value
-                    if '|' in pair:
-                        # Split only once
-                        key, val = [p.strip() for p in pair.split('|', 1)] 
-                        if key and val: 
-                            kv_lines.append(f'\t\t\t"{key}" "{val}"')
-                    # 否则：跳过格式不正确的键值对
-
-                # End Nested Block
-                kv_lines.append('\t\t}')
-            
-            # 普通字段（不含 | 或 ,）
-            else:
-                # 写入 Key-Value pair
-                kv_lines.append(f'\t\t"{header}" "{value_str}"')
-
-        # End Primary Key Block
-        kv_lines.append('\t}')
-
-    # 3. Close Root Block
-    kv_lines.append('}')
-    
-    # Write to file
-    with open(output_path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(kv_lines))
+    rendered = render_kv_with_preserved_comments(root_name, pks, metadata)
+    with open(output_path, "w", encoding="utf-8", newline="") as f:
+        f.write(rendered)
         
 ############################################
 #               GUI 部分
