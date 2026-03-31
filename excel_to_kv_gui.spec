@@ -1,12 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from PyInstaller.utils.hooks import collect_submodules
+
 
 a = Analysis(
     ['excel_to_kv_gui.py'],
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=[],
+    hiddenimports=collect_submodules('openpyxl') + ['et_xmlfile'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

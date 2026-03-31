@@ -26,6 +26,7 @@ BACKEND_CONFIG_ROOTS = {
     "shop1_items_enhance.txt": ("shop1_items_enhance", None),
     "shop1_items_enhance_passive.txt": ("shop1_items_enhance_passive", None),
     "Stage.txt": ("stage", "Stage"),
+    "enchant.txt": ("enchant", "Enchant"),
 }
 MONSTER_WAVES_PATTERN = re.compile(r"^monster_waves_(\d+)\.txt$", re.IGNORECASE)
 KV_COMMENT_PATTERN = re.compile(r"//.*?$|/\*.*?\*/", re.MULTILINE | re.DOTALL)
@@ -457,6 +458,17 @@ def export_backend_configs_json(output_root):
 #               KV 转换核心
 ############################################
 
+def ensure_writable_file(path):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    if os.path.exists(path):
+        try:
+            os.chmod(path, 0o666)
+        except Exception:
+            pass
+
 def excel_to_kv(excel_path, output_path):
     # Version: 3.1.0
     
@@ -475,6 +487,7 @@ def excel_to_kv(excel_path, output_path):
             metadata = {}
 
     rendered = render_kv_with_preserved_comments(root_name, pks, metadata)
+    ensure_writable_file(output_path)
     with open(output_path, "w", encoding="utf-8", newline="") as f:
         f.write(rendered)
         
