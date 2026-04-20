@@ -27,6 +27,10 @@ BACKEND_CONFIG_ROOTS = {
     "shop1_items_enhance_passive.txt": ("shop1_items_enhance_passive", None),
     "Stage.txt": ("stage", "Stage"),
     "enchant.txt": ("enchant", "Enchant"),
+    "collection.txt": ("collection", "Collection"),
+    "task.txt": ("task", "Task"),
+    "battlepass.txt": ("battlepass", "BattlePass"),
+    "StageEXP.txt": ("stage_exp", "Stage EXP"),
 }
 MONSTER_WAVES_PATTERN = re.compile(r"^monster_waves_(\d+)\.txt$", re.IGNORECASE)
 KV_COMMENT_PATTERN = re.compile(r"//.*?$|/\*.*?\*/", re.MULTILINE | re.DOTALL)
