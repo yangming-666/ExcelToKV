@@ -10,28 +10,7 @@ import kv_to_excel_idempotent_sync
 
 CONFIG_FILE = "config.json"
 BACKEND_CONFIG_EXPORT_FILENAME = "configs.json"
-BACKEND_CONFIG_ROOTS = {
-    "account_progression.txt": ("account_progression", "AccountProgression"),
-    "career_config.txt": ("career_config", "CareerConfig"),
-    "challenge_waves.txt": ("challenge_waves", None),
-    "hero_base.txt": ("hero_base", None),
-    "hero_growth.txt": ("hero_growth", "Growth"),
-    "monster_ability.txt": ("monster_ability", None),
-    "monster_stats.txt": ("monster_stats", None),
-    "shop1.txt": ("shop1", "ShopItems"),
-    "shop1_items.txt": ("shop1_items", "Shop1 Items"),
-    "shop1_items_meta.txt": ("shop1_items_meta", "Shop1 Items Meta"),
-    "meta_growth_shop.txt": ("meta_growth_shop", "MetaGrowthShop"),
-    "shop1_items_projectile.txt": ("shop1_items_projectile", None),
-    "shop1_items_enhance.txt": ("shop1_items_enhance", None),
-    "shop1_items_enhance_passive.txt": ("shop1_items_enhance_passive", None),
-    "Stage.txt": ("stage", "Stage"),
-    "enchant.txt": ("enchant", "Enchant"),
-    "collection.txt": ("collection", "Collection"),
-    "task.txt": ("task", "Task"),
-    "battlepass.txt": ("battlepass", "BattlePass"),
-    "StageEXP.txt": ("stage_exp", "Stage EXP"),
-}
+BACKEND_CONFIG_MANIFEST_RELATIVE_PATH = os.path.join("utils", "backend_config_specs.txt")
 MONSTER_WAVES_PATTERN = re.compile(r"^monster_waves_(\d+)\.txt$", re.IGNORECASE)
 KV_COMMENT_PATTERN = re.compile(r"//.*?$|/\*.*?\*/", re.MULTILINE | re.DOTALL)
 KV_TOKEN_PATTERN = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*)"|([{}])')
@@ -405,19 +384,111 @@ def normalize_config_root(parsed, root_name):
     return parsed
 
 
-def find_backend_config_files(output_root):
+def parse_bool_value(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("1", "true", "yes", "on"):
+            return True
+        if text in ("0", "false", "no", "off"):
+            return False
+    return default
+
+
+def normalize_manifest_path(path):
+    return os.path.normpath(str(path or "").replace("\\", os.sep).replace("/", os.sep))
+
+
+def find_backend_config_manifest(output_root):
+    direct_path = os.path.join(output_root, BACKEND_CONFIG_MANIFEST_RELATIVE_PATH)
+    if os.path.isfile(direct_path):
+        return direct_path
+
+    for root, dirs, files in os.walk(output_root):
+        dirs[:] = [d for d in dirs if not should_ignore_path(output_root, os.path.join(root, d))]
+        for filename in files:
+            if filename.lower() == "backend_config_specs.txt":
+                full_path = os.path.join(root, filename)
+                if not should_ignore_path(output_root, full_path):
+                    return full_path
+    return None
+
+
+def load_backend_config_specs(output_root):
+    manifest_path = find_backend_config_manifest(output_root)
+    if not manifest_path:
+        raise FileNotFoundError(
+            "未找到后端配置清单："
+            + os.path.join(output_root, BACKEND_CONFIG_MANIFEST_RELATIVE_PATH)
+        )
+
+    with open(manifest_path, "r", encoding="utf-8-sig") as f:
+        parsed = parse_kv_text(f.read())
+    manifest = parsed.get("BackendConfigSpecs", parsed)
+
+    specs = []
+    for config_key, node in manifest.items():
+        if not isinstance(node, dict) or not parse_bool_value(node.get("export"), False):
+            continue
+        rel_path = normalize_manifest_path(node.get("path") or node.get("Path"))
+        if not rel_path:
+            continue
+        root_name = node.get("root") or node.get("Root")
+        specs.append({
+            "key": config_key,
+            "root": root_name,
+            "filename": os.path.basename(rel_path),
+            "path": rel_path,
+            "export": True,
+        })
+    return specs, manifest_path
+
+
+def should_ignore_path(root_dir, path):
+    try:
+        rel_path = os.path.relpath(path, root_dir)
+    except ValueError:
+        return False
+    normalized_rel = os.path.normpath(rel_path).replace('\\', '/').lower()
+    
+    cfg = load_config()
+    ignored_patterns = cfg.get("ignore_paths", ["abilities"])
+    for pattern in ignored_patterns:
+        norm_pattern = os.path.normpath(pattern).replace('\\', '/').lower()
+        if normalized_rel == norm_pattern or normalized_rel.startswith(norm_pattern + "/"):
+            return True
+    return False
+
+
+def find_backend_config_files(output_root, specs):
     matched = {}
     monster_wave_files = {}
+    by_filename = {}
+    for spec in specs:
+        by_filename.setdefault(spec["filename"].lower(), []).append(spec)
+        if spec.get("path"):
+            expected_path = os.path.join(output_root, spec["path"])
+            if os.path.isfile(expected_path):
+                matched[spec["key"]] = expected_path
 
-    for root, _, files in os.walk(output_root):
+    for root, dirs, files in os.walk(output_root):
+        dirs[:] = [d for d in dirs if not should_ignore_path(output_root, os.path.join(root, d))]
         for filename in files:
-            lower_name = filename.lower()
             full_path = os.path.join(root, filename)
+            if should_ignore_path(output_root, full_path):
+                continue
+            lower_name = filename.lower()
 
-            for expected_name in BACKEND_CONFIG_ROOTS:
-                if lower_name == expected_name.lower():
-                    matched[expected_name] = full_path
-                    break
+            for spec in by_filename.get(lower_name, []):
+                if spec.get("path"):
+                    expected_path = os.path.normcase(os.path.normpath(os.path.join(output_root, spec["path"])))
+                    actual_path = os.path.normcase(os.path.normpath(full_path))
+                    if expected_path != actual_path:
+                        continue
+                matched[spec["key"]] = full_path
 
             wave_match = MONSTER_WAVES_PATTERN.match(filename)
             if wave_match:
@@ -427,17 +498,19 @@ def find_backend_config_files(output_root):
 
 
 def export_backend_configs_json(output_root):
-    matched_files, monster_wave_files = find_backend_config_files(output_root)
-    missing = [name for name in BACKEND_CONFIG_ROOTS if name not in matched_files]
+    specs, manifest_path = load_backend_config_specs(output_root)
+    matched_files, monster_wave_files = find_backend_config_files(output_root, specs)
+    missing = [spec["path"] or spec["filename"] for spec in specs if spec["key"] not in matched_files]
 
     configs = {}
-    for filename, (config_key, root_name) in BACKEND_CONFIG_ROOTS.items():
-        kv_path = matched_files.get(filename)
+    for spec in specs:
+        config_key = spec["key"]
+        kv_path = matched_files.get(config_key)
         if not kv_path:
             continue
         with open(kv_path, "r", encoding="utf-8-sig") as f:
             parsed = parse_kv_text(f.read())
-        configs[config_key] = normalize_config_root(parsed, root_name)
+        configs[config_key] = normalize_config_root(parsed, spec.get("root"))
 
     monster_waves = {}
     for level in sorted(monster_wave_files, key=lambda x: int(x)):
@@ -647,9 +720,13 @@ class App:
             # 递归搜索原始 txt（保持你原来的逻辑）
             matched_path = None
             for root, dirs, files in os.walk(output_root):
+                dirs[:] = [d for d in dirs if not should_ignore_path(output_root, os.path.join(root, d))]
                 for f in files:
+                    full_path = os.path.join(root, f)
+                    if should_ignore_path(output_root, full_path):
+                        continue
                     if f.lower() == target_filename.lower():
-                        matched_path = os.path.join(root, f)
+                        matched_path = full_path
                         break
                 if matched_path:
                     break
@@ -753,9 +830,13 @@ class App:
             # 在 KV 输出目录中查找同名 KV
             kv_path = None
             for root, dirs, files in os.walk(kv_root):
+                dirs[:] = [d for d in dirs if not should_ignore_path(kv_root, os.path.join(root, d))]
                 for f in files:
+                    full_path = os.path.join(root, f)
+                    if should_ignore_path(kv_root, full_path):
+                        continue
                     if f.lower() == kv_name.lower():
-                        kv_path = os.path.join(root, f)
+                        kv_path = full_path
                         break
                 if kv_path:
                     break
