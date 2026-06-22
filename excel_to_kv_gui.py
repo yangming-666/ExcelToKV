@@ -11,7 +11,7 @@ import kv_to_excel_idempotent_sync
 CONFIG_FILE = "config.json"
 BACKEND_CONFIG_EXPORT_FILENAME = "configs.json"
 BACKEND_CONFIG_MANIFEST_RELATIVE_PATH = os.path.join("utils", "backend_config_specs.txt")
-MONSTER_WAVES_PATTERN = re.compile(r"^monster_waves_(\d+)\.txt$", re.IGNORECASE)
+MONSTER_WAVES_RELATIVE_PATH = os.path.join("monsters", "monster_waves.txt")
 KV_COMMENT_PATTERN = re.compile(r"//.*?$|/\*.*?\*/", re.MULTILINE | re.DOTALL)
 KV_TOKEN_PATTERN = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*)"|([{}])')
 KV_QUOTED_RE = re.compile(r'"([^"]*)"')
@@ -465,7 +465,6 @@ def should_ignore_path(root_dir, path):
 
 def find_backend_config_files(output_root, specs):
     matched = {}
-    monster_wave_files = {}
     by_filename = {}
     for spec in specs:
         by_filename.setdefault(spec["filename"].lower(), []).append(spec)
@@ -490,16 +489,16 @@ def find_backend_config_files(output_root, specs):
                         continue
                 matched[spec["key"]] = full_path
 
-            wave_match = MONSTER_WAVES_PATTERN.match(filename)
-            if wave_match:
-                monster_wave_files[wave_match.group(1)] = full_path
+    monster_waves_path = os.path.join(output_root, MONSTER_WAVES_RELATIVE_PATH)
+    if not os.path.isfile(monster_waves_path):
+        monster_waves_path = None
 
-    return matched, monster_wave_files
+    return matched, monster_waves_path
 
 
 def export_backend_configs_json(output_root):
     specs, manifest_path = load_backend_config_specs(output_root)
-    matched_files, monster_wave_files = find_backend_config_files(output_root, specs)
+    matched_files, monster_waves_path = find_backend_config_files(output_root, specs)
     missing = [spec["path"] or spec["filename"] for spec in specs if spec["key"] not in matched_files]
 
     configs = {}
@@ -512,14 +511,11 @@ def export_backend_configs_json(output_root):
             parsed = parse_kv_text(f.read())
         configs[config_key] = normalize_config_root(parsed, spec.get("root"))
 
-    monster_waves = {}
-    for level in sorted(monster_wave_files, key=lambda x: int(x)):
-        with open(monster_wave_files[level], "r", encoding="utf-8-sig") as f:
-            monster_waves[level] = parse_kv_text(f.read())
-    if monster_waves:
-        configs["monster_waves"] = monster_waves
+    if monster_waves_path:
+        with open(monster_waves_path, "r", encoding="utf-8-sig") as f:
+            configs["monster_waves"] = parse_kv_text(f.read())
     else:
-        missing.append("monster_waves_*.txt")
+        missing.append(MONSTER_WAVES_RELATIVE_PATH)
 
     json_dir = os.path.join(get_runtime_dir(), "JSON")
     os.makedirs(json_dir, exist_ok=True)
