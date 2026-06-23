@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 import re
+import copy
 import kv_to_excel_idempotent_sync
 
 CONFIG_FILE = "config.json"
@@ -384,6 +385,400 @@ def normalize_config_root(parsed, root_name):
     return parsed
 
 
+COMPACT_MARKER_KEY = "__compact_v1"
+COMPACT_MISSING = {"__compact_missing": 1}
+COMPACT_MISSING_SHORT = []
+COMPACT_DEFAULT_SHORT = False
+COMPACT_NUMBER_PATTERN = re.compile(r"^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
+COMPACT_META_ALIASES = {
+    "__compact_v1": "_",
+    "keys": "k",
+    "rows": "r",
+    "number_keys": "n",
+    "stage_first": "f",
+    "stages": "s",
+    "dicts": "d",
+    "defaults": "x",
+}
+COMPACT_STRING_FIELD_KEYWORDS = (
+    "name",
+    "source",
+    "raw",
+    "icon",
+    "image",
+    "model",
+    "path",
+    "sound",
+    "particle",
+    "modifier",
+    "ability",
+    "hero",
+    "unit",
+    "monster",
+    "career",
+    "projectile",
+)
+
+
+def is_compact_missing(value):
+    return value == COMPACT_MISSING_SHORT or (
+        isinstance(value, dict) and value.get("__compact_missing") == 1 and len(value) == 1
+    )
+
+
+def is_compact_default(value):
+    return value is COMPACT_DEFAULT_SHORT
+
+
+def compact_get(node, long_key, default=None):
+    if not isinstance(node, dict):
+        return default
+    if long_key in node:
+        return node[long_key]
+    short_key = COMPACT_META_ALIASES.get(long_key)
+    if short_key and short_key in node:
+        return node[short_key]
+    return default
+
+
+def encode_compact_value(value):
+    if isinstance(value, str) and COMPACT_NUMBER_PATTERN.match(value):
+        if "." in value:
+            return float(value)
+        return int(value)
+    return value
+
+
+def decode_compact_value(value):
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if isinstance(value, float) and value.is_integer():
+            return str(int(value))
+        return str(value)
+    return value
+
+
+def is_safe_number_path(path, values):
+    if not path:
+        return False
+    leaf = str(path[-1] or "")
+    lower_leaf = leaf.lower()
+    if lower_leaf.endswith("id"):
+        return False
+    for keyword in COMPACT_STRING_FIELD_KEYWORDS:
+        if keyword in lower_leaf:
+            return False
+
+    found_value = False
+    for value in values:
+        if is_compact_missing(value):
+            continue
+        found_value = True
+        if isinstance(value, bool):
+            return False
+        if isinstance(value, (int, float)):
+            continue
+        if not isinstance(value, str) or not COMPACT_NUMBER_PATTERN.match(value):
+            return False
+    return found_value
+
+
+def flatten_compact_record(node, prefix=()):
+    out = {}
+    for key, value in node.items():
+        path = prefix + (str(key),)
+        if isinstance(value, dict) and value and not is_compact_missing(value):
+            out.update(flatten_compact_record(value, path))
+        else:
+            out[path] = value
+    return out
+
+
+def compact_path_to_json_key(path):
+    if len(path) == 1:
+        return path[0]
+    return list(path)
+
+
+def compact_json_key_to_path(key):
+    if isinstance(key, list):
+        return tuple(str(part) for part in key)
+    return (str(key),)
+
+
+def set_compact_path(node, path, value):
+    current = node
+    for part in path[:-1]:
+        current = current.setdefault(part, {})
+    current[path[-1]] = value
+
+
+def compact_flat_rows_from_records(records, row_order=None):
+    if row_order is None:
+        row_order = list(records.keys())
+
+    flat_rows = {}
+    path_first_index = {}
+    path_counts = {}
+    next_index = 0
+    for row_key in row_order:
+        row = records[row_key]
+        flattened = flatten_compact_record(row)
+        if not flattened:
+            return None
+        flat_rows[row_key] = flattened
+        for path in flattened:
+            if path not in path_first_index:
+                path_first_index[path] = next_index
+                next_index += 1
+            path_counts[path] = path_counts.get(path, 0) + 1
+
+    paths = sorted(path_first_index.keys(), key=lambda path: (-path_counts[path], path_first_index[path]))
+    path_values = {path: [] for path in paths}
+    rows = {}
+    for row_key in row_order:
+        flattened = flat_rows[row_key]
+        values = []
+        for path in paths:
+            if path in flattened:
+                raw_value = flattened[path]
+                values.append(encode_compact_value(raw_value))
+                path_values[path].append(raw_value)
+            else:
+                values.append(COMPACT_MISSING_SHORT)
+                path_values[path].append(COMPACT_MISSING_SHORT)
+        while values and is_compact_missing(values[-1]):
+            values.pop()
+        rows[row_key] = values
+
+    number_keys = []
+    for idx, path in enumerate(paths):
+        if is_safe_number_path(path, path_values[path]):
+            number_keys.append(idx + 1)
+
+    out = {
+        "k": [compact_path_to_json_key(path) for path in paths],
+        "r": rows,
+    }
+    if number_keys:
+        out["n"] = number_keys
+    return out
+
+
+def compact_monster_wave_stages(stages):
+    if not isinstance(stages, dict) or not stages:
+        return stages
+    if not all(isinstance(key, str) and len(key) == 6 and key.isdigit() for key in stages):
+        return stages
+    if not all(isinstance(value, dict) for value in stages.values()):
+        return stages
+
+    grouped = {}
+    for key, row in stages.items():
+        stage_index = int(key[:3])
+        wave_index = int(key[3:])
+        grouped.setdefault(stage_index, {})[wave_index] = row
+
+    stage_indexes = sorted(grouped)
+    if stage_indexes != list(range(stage_indexes[0], stage_indexes[-1] + 1)):
+        return stages
+
+    row_order = []
+    for stage_index in stage_indexes:
+        waves = grouped[stage_index]
+        wave_indexes = sorted(waves)
+        if wave_indexes != list(range(1, len(wave_indexes) + 1)):
+            return stages
+        for wave_index in wave_indexes:
+            row_order.append(f"{stage_index:03d}{wave_index:03d}")
+
+    flat = compact_flat_rows_from_records(stages, row_order)
+    if flat is None:
+        return stages
+
+    stage_rows = []
+    for stage_index in stage_indexes:
+        waves = []
+        for wave_index in range(1, len(grouped[stage_index]) + 1):
+            row_key = f"{stage_index:03d}{wave_index:03d}"
+            waves.append(flat["r"][row_key])
+        stage_rows.append(waves)
+
+    dicts = {}
+    monster_idx = None
+    for idx, key in enumerate(flat["k"]):
+        if key == "Monster":
+            monster_idx = idx
+            break
+    if monster_idx is not None:
+        monsters = []
+        monster_ids = {}
+        for waves in stage_rows:
+            for row in waves:
+                if len(row) <= monster_idx or not isinstance(row[monster_idx], str):
+                    continue
+                monster = row[monster_idx]
+                if monster not in monster_ids:
+                    monster_ids[monster] = len(monsters) + 1
+                    monsters.append(monster)
+                row[monster_idx] = monster_ids[monster]
+        if monsters:
+            dicts["Monster"] = monsters
+
+    defaults = [None] * len(flat["k"])
+    for idx, key in enumerate(flat["k"]):
+        if key == ["Buff", "TractionResistance_Flat"]:
+            defaults[idx] = 3000
+            for waves in stage_rows:
+                for row in waves:
+                    if idx < len(row) and row[idx] == 3000:
+                        row[idx] = COMPACT_DEFAULT_SHORT
+                    while row and is_compact_missing(row[-1]):
+                        row.pop()
+
+    candidate = {
+        "_": "stage_wave_rows",
+        "k": flat["k"],
+        "f": stage_indexes[0],
+        "s": stage_rows,
+    }
+    if flat.get("n"):
+        candidate["n"] = flat["n"]
+    if dicts:
+        candidate["d"] = dicts
+    if any(default is not None for default in defaults):
+        candidate["x"] = defaults
+    original_json = json.dumps(stages, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    compact_json = json.dumps(candidate, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(compact_json) < len(original_json):
+        return candidate
+    return stages
+
+
+def expand_compact_table(node, keep_numbers=False):
+    if isinstance(node, list):
+        return [expand_compact_table(value, keep_numbers) for value in node]
+    if not isinstance(node, dict):
+        return node
+
+    marker = compact_get(node, "__compact_v1")
+    if marker == "flat_rows":
+        raw_keys = compact_get(node, "keys", [])
+        keys = [compact_json_key_to_path(key) for key in raw_keys]
+        number_indexes = set((int(idx) - 1) for idx in compact_get(node, "number_keys", []) if isinstance(idx, int))
+        rows = compact_get(node, "rows", {})
+        defaults = compact_get(node, "defaults", [])
+        out = {}
+        for row_key, row_values in rows.items():
+            row = {}
+            if not isinstance(row_values, list):
+                raise ValueError(f"压缩配置行必须是数组：{row_key}")
+            for idx, value in enumerate(row_values):
+                if idx >= len(keys):
+                    raise ValueError(f"压缩配置行字段超出表头：{row_key}")
+                if is_compact_default(value):
+                    if idx < len(defaults) and defaults[idx] is not None:
+                        value = defaults[idx]
+                    else:
+                        raise ValueError(f"压缩配置默认值标记缺少默认值：{row_key}")
+                elif is_compact_missing(value):
+                    continue
+                if keep_numbers and idx in number_indexes:
+                    decoded = value
+                else:
+                    decoded = decode_compact_value(value)
+                set_compact_path(row, keys[idx], expand_compact_table(decoded, keep_numbers))
+            out[row_key] = row
+        return out
+    if marker == "stage_wave_rows":
+        raw_keys = compact_get(node, "keys", [])
+        keys = [compact_json_key_to_path(key) for key in raw_keys]
+        number_indexes = set((int(idx) - 1) for idx in compact_get(node, "number_keys", []) if isinstance(idx, int))
+        stages = compact_get(node, "stages", [])
+        stage_first = int(compact_get(node, "stage_first", 1))
+        defaults = compact_get(node, "defaults", [])
+        dict_indexes = {}
+        dicts = compact_get(node, "dicts", {})
+        if isinstance(dicts, dict):
+            for dict_key, dict_values in dicts.items():
+                if isinstance(dict_values, list):
+                    for idx, raw_key in enumerate(raw_keys):
+                        if raw_key == dict_key:
+                            dict_indexes[idx] = dict_values
+                            break
+        if not isinstance(stages, list):
+            raise ValueError("压缩 monster_waves stages 必须是数组")
+        out = {}
+        for stage_offset, stage_rows in enumerate(stages):
+            if not isinstance(stage_rows, list):
+                raise ValueError(f"压缩 monster_waves 关卡必须是数组：{stage_offset}")
+            stage_index = stage_first + stage_offset
+            for wave_offset, row_values in enumerate(stage_rows):
+                if not isinstance(row_values, list):
+                    raise ValueError(f"压缩 monster_waves 波次必须是数组：{stage_index}/{wave_offset + 1}")
+                row = {}
+                for idx, value in enumerate(row_values):
+                    if idx >= len(keys):
+                        raise ValueError(f"压缩 monster_waves 行字段超出表头：{stage_index}/{wave_offset + 1}")
+                    if is_compact_default(value):
+                        if idx < len(defaults) and defaults[idx] is not None:
+                            value = defaults[idx]
+                        else:
+                            raise ValueError(f"压缩 monster_waves 默认值标记缺少默认值：{stage_index}/{wave_offset + 1}")
+                    elif is_compact_missing(value):
+                        continue
+                    if idx in dict_indexes:
+                        dict_values = dict_indexes[idx]
+                        if not isinstance(value, int) or value < 1 or value > len(dict_values):
+                            raise ValueError(f"压缩 monster_waves 字典索引无效：{stage_index}/{wave_offset + 1}")
+                        value = dict_values[value - 1]
+                    elif keep_numbers and idx in number_indexes:
+                        value = value
+                    else:
+                        value = decode_compact_value(value)
+                    set_compact_path(row, keys[idx], expand_compact_table(value, keep_numbers))
+                out[f"{stage_index:03d}{wave_offset + 1:03d}"] = row
+        return out
+
+    return {key: expand_compact_table(value, keep_numbers) for key, value in node.items()}
+
+
+def compact_table_node(node, min_rows=4, min_saved_bytes=128):
+    if isinstance(node, list):
+        return [compact_table_node(value, min_rows, min_saved_bytes) for value in node]
+    if not isinstance(node, dict):
+        return node
+
+    children = {key: compact_table_node(value, min_rows, min_saved_bytes) for key, value in node.items()}
+    if len(children) < min_rows:
+        return children
+    if COMPACT_MARKER_KEY in children or COMPACT_META_ALIASES[COMPACT_MARKER_KEY] in children:
+        return children
+    if not all(
+        isinstance(value, dict)
+        and COMPACT_MARKER_KEY not in value
+        and COMPACT_META_ALIASES[COMPACT_MARKER_KEY] not in value
+        for value in children.values()
+    ):
+        return children
+
+    flat = compact_flat_rows_from_records(children)
+    if flat is None:
+        return children
+
+    candidate = {
+        "_": "flat_rows",
+        "k": flat["k"],
+        "r": flat["r"],
+    }
+    if flat.get("n"):
+        candidate["n"] = flat["n"]
+    original_json = json.dumps(children, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    compact_json = json.dumps(candidate, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(original_json) - len(compact_json) >= min_saved_bytes and len(compact_json) < len(original_json) * 0.95:
+        return candidate
+    return children
+
+
 def parse_bool_value(value, default=False):
     if isinstance(value, bool):
         return value
@@ -517,12 +912,21 @@ def export_backend_configs_json(output_root):
     else:
         missing.append(MONSTER_WAVES_RELATIVE_PATH)
 
+    original_configs = copy.deepcopy(configs)
+    if isinstance(configs.get("monster_waves"), dict) and isinstance(configs["monster_waves"].get("Stages"), dict):
+        configs["monster_waves"]["Stages"] = compact_monster_wave_stages(configs["monster_waves"]["Stages"])
+
+    compact_payload = {"configs": compact_table_node(configs)}
+    expanded_configs = expand_compact_table(compact_payload).get("configs")
+    if expanded_configs != original_configs:
+        raise ValueError("后端配置压缩校验失败：展开结果与原始配置不一致")
+
     json_dir = os.path.join(get_runtime_dir(), "JSON")
     os.makedirs(json_dir, exist_ok=True)
     json_path = os.path.join(json_dir, BACKEND_CONFIG_EXPORT_FILENAME)
 
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump({"configs": configs}, f, ensure_ascii=False, indent=2)
+        json.dump(compact_payload, f, ensure_ascii=False, separators=(",", ":"))
 
     return json_path, missing
 
