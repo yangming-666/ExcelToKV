@@ -11,6 +11,7 @@ import kv_to_excel_idempotent_sync
 
 CONFIG_FILE = "config.json"
 BACKEND_CONFIG_EXPORT_FILENAME = "configs.json"
+BACKEND_CONFIG_EXPORT_ORIGINAL_FILENAME = "configs_original.json"
 BACKEND_CONFIG_MANIFEST_RELATIVE_PATH = os.path.join("utils", "backend_config_specs.txt")
 MONSTER_WAVES_RELATIVE_PATH = os.path.join("monsters", "monster_waves.txt")
 KV_COMMENT_PATTERN = re.compile(r"//.*?$|/\*.*?\*/", re.MULTILINE | re.DOTALL)
@@ -928,7 +929,12 @@ def export_backend_configs_json(output_root):
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(compact_payload, f, ensure_ascii=False, separators=(",", ":"))
 
-    return json_path, missing
+    original_payload = {"configs": original_configs}
+    original_json_path = os.path.join(json_dir, BACKEND_CONFIG_EXPORT_ORIGINAL_FILENAME)
+    with open(original_json_path, "w", encoding="utf-8") as f:
+        json.dump(original_payload, f, ensure_ascii=False, indent=2)
+
+    return json_path, original_json_path, missing
 
 
 ############################################
@@ -1143,11 +1149,12 @@ class App:
 
         if success > 0:
             json_path = None
+            original_json_path = None
             export_missing = []
             export_error = None
 
             try:
-                json_path, export_missing = export_backend_configs_json(output_root)
+                json_path, original_json_path, export_missing = export_backend_configs_json(output_root)
             except Exception as e:
                 export_error = str(e)
 
@@ -1159,7 +1166,9 @@ class App:
                 summary_lines.append("失败文件列表：")
                 summary_lines.extend(failed)
             if json_path:
-                summary_lines.append(f"已导出后端配置 JSON：{json_path}")
+                summary_lines.append(f"已导出压缩版 JSON：{json_path}")
+            if original_json_path:
+                summary_lines.append(f"已导出原始版 JSON：{original_json_path}")
             if export_missing:
                 summary_lines.append("以下配置 TXT 未找到，未写入 JSON：")
                 summary_lines.extend(export_missing)
